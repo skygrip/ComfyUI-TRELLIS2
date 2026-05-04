@@ -28,6 +28,9 @@ ComfyUI custom nodes for [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) - M
 
 Generate high-quality 3D meshes with PBR (Physically Based Rendering) materials from a single image.
 
+---
+
+
 ## Example Workfloww
 
 ![tpose](docs/tpose.png)
