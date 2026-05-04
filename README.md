@@ -1,5 +1,24 @@
 # ComfyUI-TRELLIS2
 
+## Installation
+
+Three options, in order of speed → reliability:
+
+1. **ComfyUI Manager (nightly)** — search for `ComfyUI-TRELLIS2` in the Manager and click Install. Fastest, but the Manager's nightly index can lag.
+2. **Manager via Git URL** — in ComfyUI Manager: "Install via Git URL" with `https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2.git`.
+3. **Manual (most reliable)**:
+   ```bash
+   cd ComfyUI/custom_nodes
+   git clone https://github.com/PozzettiAndrea/ComfyUI-TRELLIS2.git
+   cd ComfyUI-TRELLIS2
+   pip install -r requirements.txt --upgrade
+   python install.py
+   ```
+
+---
+
+
+
 <div align="center">
 <a href="https://pozzettiandrea.github.io/ComfyUI-TRELLIS2/">
 <img src="https://pozzettiandrea.github.io/ComfyUI-TRELLIS2/gallery-preview.png" alt="Workflow Test Gallery" width="800">
@@ -12,9 +31,7 @@ ComfyUI custom nodes for [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) - M
 
 Generate high-quality 3D meshes with PBR (Physically Based Rendering) materials from a single image.
 
-### Install via ComfyUI Manager (Recommended)
 
-Search for "ComfyUI-TRELLIS2" in ComfyUI Manager and click install.
 
 ## Example Workfloww
 
