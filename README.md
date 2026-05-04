@@ -15,6 +15,9 @@ Three options, in order of speed → reliability:
    python install.py
    ```
 
+---
+
+
 
 <div align="center">
 <a href="https://pozzettiandrea.github.io/ComfyUI-TRELLIS2/">
@@ -28,7 +31,6 @@ ComfyUI custom nodes for [TRELLIS.2](https://github.com/microsoft/TRELLIS.2) - M
 
 Generate high-quality 3D meshes with PBR (Physically Based Rendering) materials from a single image.
 
----
 
 
 ## Example Workfloww
