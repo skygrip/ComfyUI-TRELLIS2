@@ -521,12 +521,6 @@ Parameters:
                 io.Int.Input("texture_size", default=2048, min=512, max=16384, step=512),
                 io.Custom("TRIMESH").Input("original_mesh", optional=True,
                     tooltip="Original mesh (pre-simplification) for BVH projection. Improves texture accuracy by projecting texel positions back to the original surface."),
-                io.Combo.Input("rasterizer", options=["nvdiffrast", "drtk", "compare"],
-                    default="nvdiffrast", optional=True,
-                    tooltip="Rasterization backend. nvdiffrast matches original TRELLIS.2, drtk is alternative, compare runs both and logs differences."),
-                io.Combo.Input("debug_mode", options=["off", "position", "normal", "uv"],
-                    default="off", optional=True,
-                    tooltip="Debug: render 3D position/normal/UV as color instead of voxel PBR. Useful for diagnosing texture misalignment."),
             ],
             outputs=[
                 io.Custom("TRIMESH").Output(display_name="trimesh"),
@@ -540,8 +534,6 @@ Parameters:
         voxelgrid,
         texture_size=2048,
         original_mesh=None,
-        rasterizer="nvdiffrast",
-        debug_mode="off",
     ):
         import torch
         import cv2
@@ -594,27 +586,10 @@ Parameters:
             grid_size = torch.tensor([1024, 1024, 1024], dtype=torch.int32, device=device)
             voxel_size = (aabb[1] - aabb[0]) / grid_size
 
-        import sys
-        def _dbg(msg):
-            print(f"[RasterizePBR] {msg}", file=sys.stderr, flush=True)
-
-        _dbg("Rasterizing in UV space...")
-        _dbg(f"  vertices range: [{vertices.min(dim=0).values.tolist()}] to [{vertices.max(dim=0).values.tolist()}]")
-        _dbg(f"  uvs range: [{uvs.min(dim=0).values.tolist()}] to [{uvs.max(dim=0).values.tolist()}]")
-        _dbg(f"  voxel_size={voxel_size.tolist()}, grid_size={grid_size.tolist()}")
-
-        _dbg(f"  rasterizer backend: {rasterizer}")
-        mask, valid_pos = _rasterize_uv(
-            vertices, faces, uvs, texture_size, device, backend=rasterizer,
-        )
-
-        _dbg(f"  rasterized: {mask.sum().item()} pixels covered out of {texture_size*texture_size}")
-        _dbg(f"  valid_pos range: [{valid_pos.min(dim=0).values.tolist()}] to [{valid_pos.max(dim=0).values.tolist()}]")
+        mask, valid_pos = _rasterize_uv(vertices, faces, uvs, texture_size, device)
 
         # BVH projection: snap texel positions back to original mesh surface
         if original_mesh is not None:
-            import sys
-            print("[RasterizePBR] BVH projection: projecting texel positions to original mesh...", file=sys.stderr, flush=True)
             import cumesh_vb as CuMesh
             orig_verts = torch.tensor(original_mesh.vertices, dtype=torch.float32).to(device)
             orig_faces = torch.tensor(original_mesh.faces, dtype=torch.int32).to(device)
@@ -623,49 +598,18 @@ Parameters:
             orig_tri_verts = orig_verts[orig_faces[face_id.long()]]
             valid_pos = (orig_tri_verts * uvw.unsqueeze(-1)).sum(dim=1)
             del bvh, orig_verts, orig_faces, face_id, uvw, orig_tri_verts
-            print(f"[RasterizePBR] BVH projection done. valid_pos range: [{valid_pos.min(dim=0).values.tolist()}] to [{valid_pos.max(dim=0).values.tolist()}]", file=sys.stderr, flush=True)
 
         comfy.model_management.soft_empty_cache()
 
         # Sample voxel attributes for texture pixels
-        _dbg("Sampling voxel attributes...")
-        sample_grid = ((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3)
-        _dbg(f"  sample_grid range: [{sample_grid.min(dim=1).values.tolist()}] to [{sample_grid.max(dim=1).values.tolist()}]")
-        _dbg(f"  coords range: [{coords.min(dim=0).values.tolist()}] to [{coords.max(dim=0).values.tolist()}]")
         attrs = torch.zeros(texture_size, texture_size, attr_volume.shape[1], device=device)
         attrs[mask] = grid_sample_3d(
             attr_volume,
             torch.cat([torch.zeros_like(coords[:, :1]), coords], dim=-1),
             shape=torch.Size([1, attr_volume.shape[1], *grid_size.tolist()]),
-            grid=sample_grid,
+            grid=((valid_pos - aabb[0]) / voxel_size).reshape(1, -1, 3),
             mode='trilinear',
         )
-        _dbg(f"  sampled attrs: nonzero={(attrs.abs().sum(dim=-1) > 0).sum().item()}, mean={attrs[mask].mean().item():.4f}")
-
-        # Debug mode: override attrs with diagnostic colors
-        if debug_mode != "off":
-            _dbg(f"  DEBUG MODE: {debug_mode}")
-            n_channels = attr_volume.shape[1]
-            debug_pixels = torch.zeros(valid_pos.shape[0], n_channels, device=device)
-            if debug_mode == "position":
-                # RGB = XYZ position mapped to [0,1]
-                debug_pixels[:, 0] = valid_pos[:, 0] + 0.5
-                debug_pixels[:, 1] = valid_pos[:, 1] + 0.5
-                debug_pixels[:, 2] = valid_pos[:, 2] + 0.5
-            elif debug_mode == "uv":
-                # RGB = texel pixel coords as color
-                yy, xx = torch.where(mask)
-                debug_pixels[:, 0] = xx.float() / texture_size
-                debug_pixels[:, 1] = yy.float() / texture_size
-                debug_pixels[:, 2] = 0.5
-            elif debug_mode == "normal":
-                # Absolute position values
-                debug_pixels[:, 0] = (valid_pos[:, 0] + 0.5).abs()
-                debug_pixels[:, 1] = (valid_pos[:, 1] + 0.5).abs()
-                debug_pixels[:, 2] = (valid_pos[:, 2] + 0.5).abs()
-            debug_pixels[:, min(5, n_channels - 1)] = 1.0  # alpha = 1
-            attrs = torch.zeros(texture_size, texture_size, n_channels, device=device)
-            attrs[mask] = debug_pixels
 
         # Sample PBR attributes at vertex positions (already in internal Z-up)
         logger.info("Sampling vertex PBR attributes...")
@@ -1079,8 +1023,8 @@ def _batched_unsigned_distance(bvh, positions, batch_size=500_000, return_uvw=Fa
     )
 
 
-def _rasterize_uv(vertices, faces, uvs, texture_size, device, backend="nvdiffrast"):
-    """Rasterize mesh in UV space and return (mask, valid_pos).
+def _rasterize_uv(vertices, faces, uvs, texture_size, device):
+    """Rasterize mesh in UV space using DRTK and return (mask, valid_pos).
 
     Args:
         vertices: [V, 3] vertex positions
@@ -1088,82 +1032,13 @@ def _rasterize_uv(vertices, faces, uvs, texture_size, device, backend="nvdiffras
         uvs: [V, 2] UV coordinates in [0, 1]
         texture_size: output texture resolution
         device: torch device
-        backend: "nvdiffrast" or "drtk"
 
     Returns:
         mask: [H, W] bool tensor — which pixels are covered
         valid_pos: [N, 3] 3D positions for covered pixels
     """
-    if backend == "compare":
-        return _rasterize_uv_compare(vertices, faces, uvs, texture_size, device)
-    elif backend == "nvdiffrast":
-        return _rasterize_uv_nvdiffrast(vertices, faces, uvs, texture_size, device)
-    else:
-        return _rasterize_uv_drtk(vertices, faces, uvs, texture_size, device)
-
-
-def _rast_dbg(tag, msg):
-    import sys
-    print(f"[rast:{tag}] {msg}", file=sys.stderr, flush=True)
-
-
-def _rasterize_uv_nvdiffrast(vertices, faces, uvs, texture_size, device):
-    """Rasterize using nvdiffrast — matches original TRELLIS.2 to_glb exactly."""
-    import torch
-    import nvdiffrast.torch as dr
-    TAG = "nvdiffrast"
-
-    S = texture_size
-    chunk_size = 100_000
-
-    # UV coords to NDC [-1, 1] with z=0, w=1 (OpenGL clip space)
-    uvs_rast = torch.cat([
-        uvs * 2 - 1,
-        torch.zeros_like(uvs[:, :1]),
-        torch.ones_like(uvs[:, :1]),
-    ], dim=-1).unsqueeze(0).float()  # [1, V, 4]
-
-    # Rasterize in chunks (accumulate into single buffer)
-    ctx = dr.RasterizeCudaContext()
-    rast = torch.zeros((1, S, S, 4), device=device, dtype=torch.float32)
-
-    for i in range(0, faces.shape[0], chunk_size):
-        import comfy.model_management
-        comfy.model_management.throw_exception_if_processing_interrupted()
-        chunk_faces = faces[i:i+chunk_size].int()
-        rast_chunk, _ = dr.rasterize(ctx, uvs_rast, chunk_faces, resolution=[S, S])
-        mask_chunk = rast_chunk[..., 3:4] > 0
-        rast_chunk[..., 3:4] += i  # offset face IDs to global
-        rast = torch.where(mask_chunk, rast_chunk, rast)
-        del rast_chunk, mask_chunk
-
-    # Mask of valid pixels
-    mask = rast[0, ..., 3] > 0
-    n_covered = mask.sum().item()
-    face_ids_all = rast[0, ..., 3][mask]
-    _rast_dbg(TAG, f"covered={n_covered}/{S*S}, face_id range=[{face_ids_all.min().item():.0f}, {face_ids_all.max().item():.0f}]")
-
-    # Interpolate 3D positions at each texel
-    pos = dr.interpolate(vertices.unsqueeze(0).float(), rast, faces.int())[0][0]
-    valid_pos = pos[mask]
-
-    _rast_dbg(TAG, f"valid_pos: min={valid_pos.min(dim=0).values.tolist()}, max={valid_pos.max(dim=0).values.tolist()}, mean={valid_pos.mean(dim=0).tolist()}")
-    _rast_dbg(TAG, f"valid_pos has_nan={torch.isnan(valid_pos).any().item()}")
-    # First 5 pixels
-    for j in range(min(5, valid_pos.shape[0])):
-        _rast_dbg(TAG, f"  pixel[{j}]: pos={valid_pos[j].tolist()}, face_id={face_ids_all[j].item():.0f}")
-
-    del ctx, uvs_rast, rast, pos
-    import comfy.model_management
-    comfy.model_management.soft_empty_cache()
-    return mask, valid_pos
-
-
-def _rasterize_uv_drtk(vertices, faces, uvs, texture_size, device):
-    """Rasterize using DRTK."""
     import torch
     import drtk
-    TAG = "drtk"
 
     chunk_size = 100_000
     S = texture_size
@@ -1185,152 +1060,20 @@ def _rasterize_uv_drtk(vertices, faces, uvs, texture_size, device):
         del index_img, chunk_hit
 
     mask = rast_face_ids >= 0
-    n_covered = mask.sum().item()
-    face_ids_masked = rast_face_ids[mask]
-    _rast_dbg(TAG, f"covered={n_covered}/{S*S}, face_id range=[{face_ids_masked.min().item()}, {face_ids_masked.max().item()}]")
 
-    depth_img, bary_img = drtk.render(verts_uv, faces.int(), rast_face_ids.unsqueeze(0))
-    _rast_dbg(TAG, f"drtk.render output shapes: depth_img={list(depth_img.shape)}, bary_img={list(bary_img.shape)}")
-    _rast_dbg(TAG, f"  rast_face_ids shape={list(rast_face_ids.shape)}, mask shape={list(mask.shape)}")
-
+    _, bary_img = drtk.render(verts_uv, faces.int(), rast_face_ids.unsqueeze(0))
     # bary_img: [N, 3, H, W] -> [H, W, 3]
     bary = bary_img[0].permute(1, 2, 0)
-    _rast_dbg(TAG, f"  bary after permute: shape={list(bary.shape)}")
-
-    # Inspect a single known-covered pixel to understand axis ordering
-    ys, xs = torch.where(mask)
-    if len(ys) > 0:
-        py, px = ys[0].item(), xs[0].item()
-        fid = rast_face_ids[py, px].item()
-        _rast_dbg(TAG, f"  probe pixel ({py},{px}): face_id={fid}")
-        _rast_dbg(TAG, f"    bary_img raw [:, {py}, {px}] = {bary_img[0, :, py, px].tolist()}")
-        _rast_dbg(TAG, f"    bary after permute [{py}, {px}, :] = {bary[py, px].tolist()}")
-        tri_verts_idx = faces[fid].long()
-        _rast_dbg(TAG, f"    face vertex indices: {tri_verts_idx.tolist()}")
-        v0, v1, v2 = vertices[tri_verts_idx[0]], vertices[tri_verts_idx[1]], vertices[tri_verts_idx[2]]
-        _rast_dbg(TAG, f"    v0={v0.tolist()}")
-        _rast_dbg(TAG, f"    v1={v1.tolist()}")
-        _rast_dbg(TAG, f"    v2={v2.tolist()}")
-        b = bary[py, px]
-        interp = b[0]*v0 + b[1]*v1 + b[2]*v2
-        _rast_dbg(TAG, f"    bary={b.tolist()}, sum={b.sum().item():.6f}")
-        _rast_dbg(TAG, f"    interpolated pos={interp.tolist()}")
-        # Also check UV coords for this face
-        uv0, uv1, uv2 = uvs[tri_verts_idx[0]], uvs[tri_verts_idx[1]], uvs[tri_verts_idx[2]]
-        interp_uv = b[0]*uv0 + b[1]*uv1 + b[2]*uv2
-        expected_px = interp_uv[0].item() * texture_size
-        expected_py = (1 - interp_uv[1].item()) * texture_size  # V-flipped
-        _rast_dbg(TAG, f"    uv0={uv0.tolist()}, uv1={uv1.tolist()}, uv2={uv2.tolist()}")
-        _rast_dbg(TAG, f"    interpolated uv={interp_uv.tolist()} -> expected pixel ({expected_py:.1f}, {expected_px:.1f}), actual pixel ({py}, {px})")
 
     bary_masked = bary[mask]
-    _rast_dbg(TAG, f"bary: min={bary_masked.min(dim=0).values.tolist()}, max={bary_masked.max(dim=0).values.tolist()}, mean={bary_masked.mean(dim=0).tolist()}")
-    _rast_dbg(TAG, f"bary has_nan={torch.isnan(bary_masked).any().item()}, has_negative={(bary_masked < -0.01).any().item()}, sum_range=[{bary_masked.sum(dim=1).min().item():.4f}, {bary_masked.sum(dim=1).max().item():.4f}]")
-
     face_ids = rast_face_ids[mask].long()
     face_verts = vertices[faces[face_ids].long()]
     valid_pos = (face_verts * bary_masked.unsqueeze(-1)).sum(dim=1)
-
-    _rast_dbg(TAG, f"valid_pos: min={valid_pos.min(dim=0).values.tolist()}, max={valid_pos.max(dim=0).values.tolist()}, mean={valid_pos.mean(dim=0).tolist()}")
-    _rast_dbg(TAG, f"valid_pos has_nan={torch.isnan(valid_pos).any().item()}")
-    # First 5 pixels
-    for j in range(min(5, valid_pos.shape[0])):
-        _rast_dbg(TAG, f"  pixel[{j}]: pos={valid_pos[j].tolist()}, face_id={face_ids[j].item()}, bary={bary_masked[j].tolist()}")
-
     del verts_uv, rast_face_ids, bary_img, bary, face_verts, bary_masked, face_ids
 
     import comfy.model_management
     comfy.model_management.soft_empty_cache()
     return mask, valid_pos
-
-
-def _rasterize_uv_compare(vertices, faces, uvs, texture_size, device):
-    """Run both backends and compare results pixel-by-pixel."""
-    import torch
-    TAG = "compare"
-
-    _rast_dbg(TAG, "Running BOTH backends for comparison...")
-    mask_nv, pos_nv = _rasterize_uv_nvdiffrast(vertices, faces, uvs, texture_size, device)
-    mask_dk, pos_dk = _rasterize_uv_drtk(vertices, faces, uvs, texture_size, device)
-
-    S = texture_size
-    n_nv = mask_nv.sum().item()
-    n_dk = mask_dk.sum().item()
-    _rast_dbg(TAG, f"coverage: nvdiffrast={n_nv}, drtk={n_dk}")
-
-    # Compare masks
-    both = mask_nv & mask_dk
-    only_nv = mask_nv & ~mask_dk
-    only_dk = mask_dk & ~mask_nv
-    _rast_dbg(TAG, f"mask: both={both.sum().item()}, only_nvdiffrast={only_nv.sum().item()}, only_drtk={only_dk.sum().item()}")
-
-    # Build full position images for pixel-by-pixel comparison
-    pos_img_nv = torch.zeros(S, S, 3, device=device)
-    pos_img_dk = torch.zeros(S, S, 3, device=device)
-    pos_img_nv[mask_nv] = pos_nv
-    pos_img_dk[mask_dk] = pos_dk
-
-    # Compare positions where both have coverage
-    diff = (pos_img_nv - pos_img_dk)[both]
-    if diff.shape[0] > 0:
-        abs_diff = diff.abs()
-        _rast_dbg(TAG, f"position diff (both covered, {diff.shape[0]} pixels):")
-        _rast_dbg(TAG, f"  abs mean={abs_diff.mean(dim=0).tolist()}")
-        _rast_dbg(TAG, f"  abs max={abs_diff.max(dim=0).values.tolist()}")
-        _rast_dbg(TAG, f"  abs p99={torch.quantile(abs_diff, 0.99, dim=0).tolist()}")
-
-        # Find worst pixel
-        worst_idx = abs_diff.sum(dim=1).argmax().item()
-        both_ys, both_xs = torch.where(both)
-        wy, wx = both_ys[worst_idx].item(), both_xs[worst_idx].item()
-        _rast_dbg(TAG, f"  worst pixel ({wy},{wx}): nv={pos_img_nv[wy,wx].tolist()}, dk={pos_img_dk[wy,wx].tolist()}, diff={diff[worst_idx].tolist()}")
-
-        # Sample 10 random pixels
-        n_sample = min(10, diff.shape[0])
-        idxs = torch.randperm(diff.shape[0])[:n_sample]
-        for j in idxs:
-            y, x = both_ys[j].item(), both_xs[j].item()
-            d = diff[j].abs().sum().item()
-            if d > 0.001:  # only print if notable difference
-                _rast_dbg(TAG, f"  pixel ({y},{x}): nv={pos_img_nv[y,x].tolist()}, dk={pos_img_dk[y,x].tolist()}")
-    else:
-        _rast_dbg(TAG, "no overlapping pixels to compare!")
-
-    # Check if DRTK is vertically flipped relative to nvdiffrast
-    pos_img_dk_vflip = pos_img_dk.flip(0)  # flip rows
-    mask_dk_vflip = mask_dk.flip(0)
-    both_vflip = mask_nv & mask_dk_vflip
-    diff_vflip = (pos_img_nv - pos_img_dk_vflip)[both_vflip]
-    if diff_vflip.shape[0] > 0:
-        _rast_dbg(TAG, f"V-FLIP test: both={both_vflip.sum().item()}, abs mean={diff_vflip.abs().mean(dim=0).tolist()}, abs max={diff_vflip.abs().max(dim=0).values.tolist()}")
-    else:
-        _rast_dbg(TAG, f"V-FLIP test: no overlap")
-
-    # Check if DRTK is horizontally flipped
-    pos_img_dk_hflip = pos_img_dk.flip(1)
-    mask_dk_hflip = mask_dk.flip(1)
-    both_hflip = mask_nv & mask_dk_hflip
-    diff_hflip = (pos_img_nv - pos_img_dk_hflip)[both_hflip]
-    if diff_hflip.shape[0] > 0:
-        _rast_dbg(TAG, f"H-FLIP test: both={both_hflip.sum().item()}, abs mean={diff_hflip.abs().mean(dim=0).tolist()}, abs max={diff_hflip.abs().max(dim=0).values.tolist()}")
-    else:
-        _rast_dbg(TAG, f"H-FLIP test: no overlap")
-
-    # Check if DRTK is transposed (X/Y swap)
-    pos_img_dk_transpose = pos_img_dk.permute(1, 0, 2)
-    mask_dk_transpose = mask_dk.T
-    both_transpose = mask_nv & mask_dk_transpose
-    diff_transpose = (pos_img_nv - pos_img_dk_transpose)[both_transpose]
-    if diff_transpose.shape[0] > 0:
-        _rast_dbg(TAG, f"TRANSPOSE test: both={both_transpose.sum().item()}, abs mean={diff_transpose.abs().mean(dim=0).tolist()}, abs max={diff_transpose.abs().max(dim=0).values.tolist()}")
-    else:
-        _rast_dbg(TAG, f"TRANSPOSE test: no overlap")
-
-    del pos_img_nv, pos_img_dk, diff
-
-    # Return nvdiffrast result (the known-good one)
-    _rast_dbg(TAG, "returning nvdiffrast result")
-    return mask_nv, pos_nv
 
 
 class Trellis2ExportGLB(io.ComfyNode):
