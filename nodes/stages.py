@@ -960,6 +960,7 @@ def run_shape_generation(
     comfy.model_management.soft_empty_cache()
 
     mesh = meshes[0]
+    mesh.fill_holes()  # match original decode_latent()
 
     # Serialize shape_slat and subs to CPU — they're huge sparse tensors
     # on GPU that aren't needed for mesh post-processing.
