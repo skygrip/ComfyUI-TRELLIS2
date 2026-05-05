@@ -42,22 +42,16 @@ TEXTURE_RESOLUTION_MAP = {
 
 def _preprocess_mesh(vertices: torch.Tensor, faces: torch.Tensor):
     """
-    Center and scale a mesh to [-0.5, 0.5]^3, convert Z-up (ComfyUI) to Y-up (internal).
+    Center and scale a mesh to [-0.5, 0.5]^3.
 
     Args:
-        vertices: (N, 3) float tensor, Z-up coordinate system
+        vertices: (N, 3) float tensor in Z-up coordinate system
         faces: (M, 3) int tensor
 
     Returns:
-        (vertices, faces) in internal Y-up coordinate system, scaled to [-0.5, 0.5]^3
+        (vertices, faces) centered and scaled to [-0.5, 0.5]^3
     """
     verts = vertices.clone().float()
-
-    # Convert Z-up -> Y-up: y_new = z_old, z_new = -y_old
-    y_old = verts[:, 1].clone()
-    z_old = verts[:, 2].clone()
-    verts[:, 1] = z_old
-    verts[:, 2] = -y_old
 
     # Center and scale to [-0.5, 0.5]^3
     vmin = verts.min(dim=0).values
