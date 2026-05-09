@@ -78,6 +78,9 @@ class BiRefNet:
         device = comfy.model_management.get_torch_device()
         image_size = image.size
         input_images = self.transform_image(image).unsqueeze(0).to(device)
+        # Match model dtype (fp16/bf16) to avoid "Input type (float) and bias type (Half)" error
+        model_dtype = next(self.model.parameters()).dtype
+        input_images = input_images.to(dtype=model_dtype)
         # Prediction
         with torch.no_grad():
             preds = self.model(input_images)[-1].sigmoid().cpu()
