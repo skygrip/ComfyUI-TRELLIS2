@@ -20,6 +20,7 @@ comfy-sparse-attn = "*"
 trimesh = { version = "*", extras = ["easy"] }
 plyfile = "*"
 zstandard = "*"
+psutil = "*"
 
 # Image processing
 pillow = ">=9.0.0"
