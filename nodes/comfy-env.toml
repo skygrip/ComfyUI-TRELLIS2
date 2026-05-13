@@ -22,6 +22,7 @@ plyfile = "*"
 zstandard = "*"
 psutil = "*"
 einops = "*"
+transformers = "*"
 
 # Image processing
 pillow = ">=9.0.0"
